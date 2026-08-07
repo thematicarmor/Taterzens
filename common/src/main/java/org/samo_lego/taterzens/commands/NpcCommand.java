@@ -95,6 +95,7 @@ public class NpcCommand {
                 )
         );
 
+        AiCommand.registerNode(npcNode);
         EditCommand.registerNode(dispatcher, npcNode, commandBuildContext);
         PresetCommand.registerNode(npcNode);
         TeleportCommand.registerNode(npcNode);

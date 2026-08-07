@@ -66,6 +66,7 @@ import org.samo_lego.taterzens.interfaces.ITaterzenPlayer;
 import org.samo_lego.taterzens.mixin.accessors.AChunkMap;
 import org.samo_lego.taterzens.mixin.accessors.AClientboundAddPlayerPacket;
 import org.samo_lego.taterzens.mixin.accessors.AEntityTrackerEntry;
+import org.samo_lego.taterzens.npc.ai.*;
 import org.samo_lego.taterzens.npc.ai.goal.*;
 import org.samo_lego.taterzens.npc.commands.AbstractTaterzenCommand;
 import org.samo_lego.taterzens.npc.commands.CommandGroups;
@@ -514,6 +515,10 @@ public class TaterzenNPC extends PathfinderMob implements CrossbowAttackMob, Ran
             super.aiStep();
             if (this.isAggressive() && this.getTag("JumpAttack", config.defaults.jumpWhileAttacking) && this.onGround() && target != null && this.distanceToSqr(target) < 4.0D && this.random.nextInt(5) == 0)
                 this.jumpFromGround();
+        } else if (this.hasAiGoals()) {
+            // Attached goals only tick inside super.aiStep(), which the branch below skips.
+            // Item pickup is handled by super, so it isn't repeated here.
+            super.aiStep();
         } else {
             // As super.aiStep() isn't executed, we check for items that are available to be picked up
             if (this.isAlive() && !this.dead) {
@@ -535,6 +540,8 @@ public class TaterzenNPC extends PathfinderMob implements CrossbowAttackMob, Ran
     @Override
     public void tick() {
         super.tick();
+
+        this.tickAiGoals();
 
         AABB box = this.getBoundingBox().inflate(4.0D);
         List<ServerPlayer> players = this.level().getEntitiesOfClass(ServerPlayer.class, box);
@@ -810,6 +817,20 @@ public class TaterzenNPC extends PathfinderMob implements CrossbowAttackMob, Ran
         this.gameProfile = new GameProfile(this.getUUID(), profileName);
 
         // Skin is cached
+        // Attached AI goals, rebuilt from their saved configuration
+        ListTag aiGoals = (ListTag) npcTag.get("AiGoals");
+        if (aiGoals != null) {
+            this.clearAiGoals();
+
+            aiGoals.forEach(goalTag -> {
+                AppliedGoal applied = AppliedGoal.fromTag((CompoundTag) goalTag);
+                if (applied != null)
+                    this.npcData.aiGoals.add(applied);
+            });
+
+            this.reapplyAiGoals();
+        }
+
         CompoundTag skinTag = npcTag.getCompound("skin");
         this.setSkinFromTag(skinTag);
 
@@ -972,6 +993,11 @@ public class TaterzenNPC extends PathfinderMob implements CrossbowAttackMob, Ran
             npcTag.putUUID("LockedBy", this.lockedUuid);
 
         npcTag.putLong("MinCommandInteractionTime", this.npcData.minCommandInteractionTime);
+
+        // Attached AI goals
+        ListTag aiGoals = new ListTag();
+        this.npcData.aiGoals.forEach(applied -> aiGoals.add(applied.toTag()));
+        npcTag.put("AiGoals", aiGoals);
 
         tag.put("TaterzenNPCTag", npcTag);
     }
@@ -1405,6 +1431,125 @@ public class TaterzenNPC extends PathfinderMob implements CrossbowAttackMob, Ran
         } else {
             this.goalSelector.addGoal(3, reachMeleeAttackGoal);
         }
+    }
+
+    /**
+     * Attaches a goal from the {@link AiGoalRegistry}, replacing any previously
+     * attached goal of the same type.
+     *
+     * @param type     goal type to attach
+     * @param priority goal priority, or null to use the type's default
+     * @param rawArgs  raw {@code key=value} arguments for the goal
+     * @param duration ticks before the goal removes itself, or -1 to keep it until removed
+     * @throws IllegalArgumentException if the arguments are not valid for this goal
+     */
+    public void addAiGoal(AiGoalType type, @Nullable Integer priority, String rawArgs, int duration) {
+        this.removeAiGoal(type);
+
+        AppliedGoal applied = new AppliedGoal(
+                type,
+                priority == null ? type.defaultPriority() : priority,
+                rawArgs,
+                duration
+        );
+
+        // Built before it is recorded, so invalid arguments throw without leaving a half applied goal
+        Goal goal = type.factory().create(this, AiGoalArgs.parse(rawArgs));
+        applied.setGoal(goal);
+
+        this.npcData.aiGoals.add(applied);
+        this.selectorFor(type).addGoal(applied.priority(), goal);
+    }
+
+    /**
+     * Detaches a previously attached goal.
+     *
+     * @param type goal type to remove
+     * @return whether the Taterzen had such a goal
+     */
+    public boolean removeAiGoal(AiGoalType type) {
+        Optional<AppliedGoal> existing = this.npcData.aiGoals.stream()
+                .filter(applied -> applied.type().equals(type))
+                .findFirst();
+
+        existing.ifPresent(this::detach);
+        return existing.isPresent();
+    }
+
+    /**
+     * Detaches every attached goal.
+     *
+     * @return how many goals were removed
+     */
+    public int clearAiGoals() {
+        int count = this.npcData.aiGoals.size();
+        new ArrayList<>(this.npcData.aiGoals).forEach(this::detach);
+        return count;
+    }
+
+    /**
+     * @return the goals currently attached to this Taterzen
+     */
+    public List<AppliedGoal> getAiGoals() {
+        return Collections.unmodifiableList(this.npcData.aiGoals);
+    }
+
+    private void detach(AppliedGoal applied) {
+        if (applied.goal() != null)
+            this.selectorFor(applied.type()).removeGoal(applied.goal());
+
+        this.npcData.aiGoals.remove(applied);
+    }
+
+    private GoalSelector selectorFor(AiGoalType type) {
+        return type.targetGoal() ? this.targetSelector : this.goalSelector;
+    }
+
+    /**
+     * Rebuilds the live goal instances from the saved configuration.
+     * Goals whose arguments no longer parse are dropped with a warning rather than
+     * taking the whole Taterzen down with them.
+     */
+    private void reapplyAiGoals() {
+        List<AppliedGoal> saved = new ArrayList<>(this.npcData.aiGoals);
+        this.npcData.aiGoals.clear();
+
+        for (AppliedGoal applied : saved) {
+            try {
+                Goal goal = applied.type().factory().create(this, AiGoalArgs.parse(applied.rawArgs()));
+                applied.setGoal(goal);
+
+                this.npcData.aiGoals.add(applied);
+                this.selectorFor(applied.type()).addGoal(applied.priority(), goal);
+            } catch (IllegalArgumentException e) {
+                Taterzens.LOGGER.warn("Dropping goal {} of Taterzen {}: {}",
+                        applied.type().id(), this.getStringUUID(), e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Counts down temporary goals, removing the ones that have run out.
+     */
+    private void tickAiGoals() {
+        if (this.npcData.aiGoals.isEmpty())
+            return;
+
+        for (AppliedGoal applied : new ArrayList<>(this.npcData.aiGoals)) {
+            if (applied.tickExpired())
+                this.detach(applied);
+        }
+    }
+
+    /**
+     * Whether any attached goal needs the vanilla AI tick to run.
+     * Without this, goals attached to a Taterzen with {@link NPCData.Movement#NONE}
+     * would sit there doing nothing, as that path skips {@code super.aiStep()}.
+     *
+     * @return true if goal ticking must happen this tick
+     */
+    public boolean hasAiGoals() {
+        return !this.npcData.aiGoals.isEmpty();
     }
 
     /**

@@ -5,6 +5,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Player;
 import org.jetbrains.annotations.Nullable;
+import org.samo_lego.taterzens.npc.ai.AppliedGoal;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -66,6 +67,12 @@ public class NPCData {
     public String commandCooldownMessage = config.defaults.commandCooldownMessage;
 
     public final Map<String, Boolean> booleanTags = new HashMap<>();
+
+    /**
+     * Goals attached on top of the ones implied by
+     * {@link NPCData#movement} and {@link NPCData#behaviour}.
+     */
+    public final ArrayList<AppliedGoal> aiGoals = new ArrayList<>();
 
     public static class Follow {
         /**
